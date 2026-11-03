@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,23 +105,19 @@ func guardFocus(browserName string) func() {
 }
 
 func openBackground(timeout time.Duration) (context.Context, func(), error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, nil, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
 	profile := filepath.Join(home(), "profile")
 	if err := os.MkdirAll(profile, 0o700); err != nil {
 		return nil, nil, err
 	}
+	portFile := filepath.Join(profile, "DevToolsActivePort")
+	os.Remove(portFile)
 	app := "Google Chrome"
 	if p := os.Getenv("REDDIT_CHROME_APP"); p != "" {
 		app = p
 	}
 	stopGuard := guardFocus(app)
-	err = exec.Command("open", "-g", "-j", "-n", "-a", app, "--args",
-		fmt.Sprintf("--remote-debugging-port=%d", port),
+	err := exec.Command("open", "-g", "-j", "-n", "-a", app, "--args",
+		"--remote-debugging-port=0",
 		"--user-data-dir="+profile, "--no-first-run", "--no-default-browser-check",
 		"--window-size=1280,900").Run()
 	if err != nil {
@@ -130,6 +126,14 @@ func openBackground(timeout time.Duration) (context.Context, func(), error) {
 	var wsURL string
 	for i := 0; i < 40 && wsURL == ""; i++ {
 		time.Sleep(500 * time.Millisecond)
+		b, err := os.ReadFile(portFile)
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(strings.TrimSpace(strings.SplitN(string(b), "\n", 2)[0]))
+		if err != nil {
+			continue
+		}
 		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/json/version", port))
 		if err != nil {
 			continue

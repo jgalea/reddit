@@ -30,6 +30,8 @@ reddit sub NAME [--sort hot|new|top] [--time ...]
 reddit page URL                   the text of any reddit.com page
 reddit research QUERY [--also "q2|q3"] [--sub NAME] [--threads N] [--terms a,b,c]
                                   search, read the top threads in one pass, and tally how many threads mention each --terms name
+reddit sentiment NAME [--also "q2|q3"] [--sub NAME] [--threads N]
+                                  the comment lines about one product or brand, split into positive and negative by cue words
 ```
 
 `--max N` caps the characters printed (default 20000). `--show` opens a visible window.
