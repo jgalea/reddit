@@ -34,6 +34,9 @@ func TestCleanThreadURL(t *testing.T) {
 	if u != "https://www.reddit.com/r/arrma/comments/abc/title/" {
 		t.Errorf("got %q", u)
 	}
+	if _, err := cleanThreadURL("https://evilreddit.com/r/x/comments/a/b/"); err == nil {
+		t.Error("lookalike host should be refused")
+	}
 	if _, err := cleanThreadURL("https://evil.example/r/x/comments/a/b/"); err == nil {
 		t.Error("non-reddit host should be refused")
 	}
@@ -69,5 +72,19 @@ func TestSearchTarget(t *testing.T) {
 	}
 	if got := searchTarget("x", "", "", ""); got != "https://www.reddit.com/search/?q=x" {
 		t.Errorf("plain search url wrong: %s", got)
+	}
+}
+
+func TestPolarityAndSnippets(t *testing.T) {
+	if polarity("Zeee is trash, they puff up") >= 0 {
+		t.Error("negative line scored non-negative")
+	}
+	if polarity("I love my CNHL packs, they held up") <= 0 {
+		t.Error("positive line scored non-positive")
+	}
+	texts := map[string]string{"u": "short\nZeee will burn your house down\nunrelated line about tires here\nZeee works great for me and is cheaper"}
+	sn := snippetsFor(texts, "zeee")
+	if len(sn) != 2 || sn[0].Score >= 0 || sn[1].Score <= 0 {
+		t.Errorf("snippets wrong: %+v", sn)
 	}
 }

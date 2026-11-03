@@ -33,6 +33,8 @@ const usage = `reddit - search and read Reddit by loading its pages in your own 
   page URL                    the text of any reddit.com page (waits for it to load)
   research QUERY [--also "q2|q3"] [--sub NAME] [--threads N] [--terms a,b,c] [--max N]
                               search, read the top threads in one go, and tally how often each --terms name is mentioned
+  sentiment NAME [--also "q2|q3"] [--sub NAME] [--threads N]
+                              the comment lines that mention NAME, split by cue-word polarity (a rough pass; read the lines)
   replies                     your inbox (replies to your posts and comments)
 
 Search and sub print each result's title and link. thread and replies print the page text.
@@ -306,6 +308,7 @@ func login() error {
 const extractJS = `(() => {
   const seen = new Set(), rows = [];
   document.querySelectorAll('a[href*="/comments/"]').forEach(a => {
+    if (!/(^|\.)reddit\.com$/.test(a.hostname)) return;
     const href = a.href.split('?')[0];
     const m = href.match(/\/r\/([^/]+)\/comments\/([^/]+)\/[^/]+\/?$/);
     if (!m || seen.has(href)) return;
@@ -367,7 +370,7 @@ func cleanThreadURL(arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !strings.HasSuffix(u.Host, "reddit.com") {
+	if h := u.Hostname(); h != "reddit.com" && !strings.HasSuffix(h, ".reddit.com") {
 		return "", fmt.Errorf("%s is not a reddit.com link", arg)
 	}
 	return "https://www.reddit.com" + u.Path, nil
@@ -452,6 +455,12 @@ func run(cmd string, args []string) error {
 		}
 		queries := append([]string{strings.Join(pos, " ")}, splitList(also, "|")...)
 		return research(ctx, queries, sub, sort, tm, threads, splitList(terms, ","), max)
+	case "sentiment":
+		if len(pos) == 0 {
+			return fmt.Errorf("sentiment needs a product or brand name")
+		}
+		term := strings.Join(pos, " ")
+		return sentiment(ctx, term, append([]string{term}, splitList(also, "|")...), sub, sort, tm, threads)
 	case "sub":
 		if len(pos) == 0 {
 			return fmt.Errorf("sub needs a subreddit name")
@@ -568,24 +577,23 @@ func countTerms(texts map[string]string, terms []string) []tally {
 	return out
 }
 
-func research(ctx context.Context, queries []string, sub, sortBy, tm string, threads int, terms []string, max int) error {
+func gather(ctx context.Context, queries []string, sub, sortBy, tm string, threads int) ([]result, map[string]string, error) {
 	var found []result
 	seen := map[string]bool{}
 	for _, q := range queries {
 		var raw string
 		if err := loadPage(ctx, searchTarget(q, sub, sortBy, tm), extractJS, &raw); err != nil {
-			return err
+			return nil, nil, err
 		}
 		for _, r := range parseResults(raw) {
-			if !seen[r.URL] {
-				seen[r.URL] = true
-				found = append(found, r)
+			clean, err := cleanThreadURL(r.URL)
+			if err != nil || seen[clean] {
+				continue
 			}
+			seen[clean] = true
+			r.URL = clean
+			found = append(found, r)
 		}
-	}
-	if len(found) == 0 {
-		fmt.Println("no results")
-		return nil
 	}
 	if threads > 0 && len(found) > threads {
 		found = found[:threads]
@@ -607,7 +615,15 @@ func research(ctx context.Context, queries []string, sub, sortBy, tm string, thr
 		texts[r.URL] = txt
 	}
 	if len(texts) == 0 {
-		return fmt.Errorf("none of the %d threads could be read", len(found))
+		return nil, nil, fmt.Errorf("no thread could be read")
+	}
+	return found, texts, nil
+}
+
+func research(ctx context.Context, queries []string, sub, sortBy, tm string, threads int, terms []string, max int) error {
+	found, texts, err := gather(ctx, queries, sub, sortBy, tm, threads)
+	if err != nil {
+		return err
 	}
 	if len(terms) > 0 {
 		fmt.Printf("Mentions across %d threads:\n", len(texts))
@@ -621,5 +637,94 @@ func research(ctx context.Context, queries []string, sub, sortBy, tm string, thr
 			fmt.Printf("=== r/%s  %s\n%s\n\n%s\n\n", r.Sub, r.Title, r.URL, clip(txt, max))
 		}
 	}
+	return nil
+}
+
+var positiveWords = []string{"love", "great", "amazing", "awesome", "solid", "reliable", "recommend", "happy", "no problems", "never had", "held up", "perfect", "best", "fantastic", "good value", "fits", "worth it", "excellent", "can't complain"}
+var negativeWords = []string{"trash", "garbage", "junk", "suck", "puff", "swell", "burn", "fire", "died", "dead", "unbalanced", "don't balance", "sag", "overpriced", "avoid", "cheap for a reason", "worst", "disappoint", "regret", "flimsy", "fail", "dnf", "bad", "cheaped out", "not worth"}
+
+type snippet struct {
+	Text  string
+	URL   string
+	Score int
+}
+
+// polarity counts positive minus negative cue words in a comment line.
+func polarity(line string) int {
+	l := strings.ToLower(line)
+	n := 0
+	for _, w := range positiveWords {
+		if strings.Contains(l, w) {
+			n++
+		}
+	}
+	for _, w := range negativeWords {
+		if strings.Contains(l, w) {
+			n--
+		}
+	}
+	return n
+}
+
+// snippetsFor returns every comment line that mentions term, with its cue-word polarity.
+func snippetsFor(texts map[string]string, term string) []snippet {
+	lt := strings.ToLower(term)
+	var out []snippet
+	urls := make([]string, 0, len(texts))
+	for u := range texts {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+	for _, u := range urls {
+		for _, line := range strings.Split(texts[u], "\n") {
+			line = strings.TrimSpace(line)
+			if len(line) < 15 || len(line) > 700 || !strings.Contains(strings.ToLower(line), lt) {
+				continue
+			}
+			out = append(out, snippet{Text: line, URL: u, Score: polarity(line)})
+		}
+	}
+	return out
+}
+
+func sentiment(ctx context.Context, term string, queries []string, sub, sortBy, tm string, threads int) error {
+	_, texts, err := gather(ctx, queries, sub, sortBy, tm, threads)
+	if err != nil {
+		return err
+	}
+	sn := snippetsFor(texts, term)
+	var pos, neg, neu []snippet
+	for _, s := range sn {
+		switch {
+		case s.Score > 0:
+			pos = append(pos, s)
+		case s.Score < 0:
+			neg = append(neg, s)
+		default:
+			neu = append(neu, s)
+		}
+	}
+	fmt.Printf("%q in %d threads: %d comment lines, %d positive, %d negative, %d neutral (cue-word count, rough; read the lines)\n\n", term, len(texts), len(sn), len(pos), len(neg), len(neu))
+	show := func(title string, list []snippet, desc bool) {
+		if len(list) == 0 {
+			return
+		}
+		sort.SliceStable(list, func(i, j int) bool {
+			if desc {
+				return list[i].Score > list[j].Score
+			}
+			return list[i].Score < list[j].Score
+		})
+		fmt.Println(title)
+		for i, s := range list {
+			if i >= 6 {
+				break
+			}
+			fmt.Printf("  - %s\n    %s\n", clip(s.Text, 300), s.URL)
+		}
+		fmt.Println()
+	}
+	show("Positive:", pos, true)
+	show("Negative:", neg, false)
 	return nil
 }
