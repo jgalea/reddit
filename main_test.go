@@ -44,3 +44,30 @@ func TestClip(t *testing.T) {
 		t.Errorf("not clipped: %q", got)
 	}
 }
+
+func TestCountTerms(t *testing.T) {
+	texts := map[string]string{
+		"a": "I run CNHL packs. cnhl is great, Ovonic is fine",
+		"b": "Ovonic 6000 here",
+		"c": "nothing relevant",
+	}
+	got := countTerms(texts, []string{"CNHL", "Ovonic", "Zeee"})
+	if got[0].Term != "Ovonic" || got[0].Threads != 2 || got[0].Mentions != 2 {
+		t.Errorf("top row wrong: %+v", got[0])
+	}
+	if got[1].Term != "CNHL" || got[1].Threads != 1 || got[1].Mentions != 2 {
+		t.Errorf("case-insensitive count wrong: %+v", got[1])
+	}
+	if got[2].Threads != 0 {
+		t.Errorf("unmentioned term should count zero: %+v", got[2])
+	}
+}
+
+func TestSearchTarget(t *testing.T) {
+	if got := searchTarget("a b", "r/arrma", "top", "year"); !strings.Contains(got, "/r/arrma/search/") || !strings.Contains(got, "restrict_sr=1") {
+		t.Errorf("sub search url wrong: %s", got)
+	}
+	if got := searchTarget("x", "", "", ""); got != "https://www.reddit.com/search/?q=x" {
+		t.Errorf("plain search url wrong: %s", got)
+	}
+}

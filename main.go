@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -30,6 +31,8 @@ const usage = `reddit - search and read Reddit by loading its pages in your own 
   thread URL                  a post with its comments (page text)
   sub NAME [--sort hot|new|top] [--time ...]
   page URL                    the text of any reddit.com page (waits for it to load)
+  research QUERY [--also "q2|q3"] [--sub NAME] [--threads N] [--terms a,b,c] [--max N]
+                              search, read the top threads in one go, and tally how often each --terms name is mentioned
   replies                     your inbox (replies to your posts and comments)
 
 Search and sub print each result's title and link. thread and replies print the page text.
@@ -328,9 +331,14 @@ func loadPage(ctx context.Context, u string, js string, out any) error {
 	)
 }
 
-func printResults(raw string, limit int) {
+func parseResults(raw string) []result {
 	var rows []result
 	json.Unmarshal([]byte(raw), &rows)
+	return rows
+}
+
+func printResults(raw string, limit int) {
+	rows := parseResults(raw)
 	if len(rows) == 0 {
 		fmt.Println("no results")
 		return
@@ -381,6 +389,11 @@ func run(cmd string, args []string) error {
 	var sub, sort, tm string
 	var limit, max int
 	var show bool
+	var threads int
+	var terms, also string
+	fs.IntVar(&threads, "threads", 8, "research: threads to read")
+	fs.StringVar(&terms, "terms", "", "research: comma-separated names to count across the threads (brands, models)")
+	fs.StringVar(&also, "also", "", "research: extra search queries, separated by |")
 	fs.StringVar(&sub, "sub", "", "restrict to one subreddit")
 	fs.StringVar(&sort, "sort", "", "sort order")
 	fs.StringVar(&tm, "time", "", "time window")
@@ -432,18 +445,13 @@ func run(cmd string, args []string) error {
 		if len(pos) == 0 {
 			return fmt.Errorf("search needs a query")
 		}
-		q := url.Values{"q": {strings.Join(pos, " ")}}
-		if sort != "" {
-			q.Set("sort", sort)
+		target = searchTarget(strings.Join(pos, " "), sub, sort, tm)
+	case "research":
+		if len(pos) == 0 {
+			return fmt.Errorf("research needs a query")
 		}
-		if tm != "" {
-			q.Set("t", tm)
-		}
-		target = "https://www.reddit.com/search/?" + q.Encode()
-		if sub != "" {
-			q.Set("restrict_sr", "1")
-			target = "https://www.reddit.com/r/" + strings.TrimPrefix(sub, "r/") + "/search/?" + q.Encode()
-		}
+		queries := append([]string{strings.Join(pos, " ")}, splitList(also, "|")...)
+		return research(ctx, queries, sub, sort, tm, threads, splitList(terms, ","), max)
 	case "sub":
 		if len(pos) == 0 {
 			return fmt.Errorf("sub needs a subreddit name")
@@ -504,4 +512,114 @@ func firstNonEmpty(a ...string) string {
 		}
 	}
 	return ""
+}
+
+func searchTarget(query, sub, sort, tm string) string {
+	q := url.Values{"q": {query}}
+	if sort != "" {
+		q.Set("sort", sort)
+	}
+	if tm != "" {
+		q.Set("t", tm)
+	}
+	if sub != "" {
+		q.Set("restrict_sr", "1")
+		return "https://www.reddit.com/r/" + strings.TrimPrefix(sub, "r/") + "/search/?" + q.Encode()
+	}
+	return "https://www.reddit.com/search/?" + q.Encode()
+}
+
+func splitList(s, sep string) []string {
+	var out []string
+	for _, p := range strings.Split(s, sep) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+type tally struct {
+	Term     string
+	Threads  int
+	Mentions int
+}
+
+// countTerms counts, case-insensitively, how many threads mention each term and how many times in all.
+func countTerms(texts map[string]string, terms []string) []tally {
+	var out []tally
+	for _, t := range terms {
+		row := tally{Term: t}
+		lt := strings.ToLower(t)
+		for _, txt := range texts {
+			if n := strings.Count(strings.ToLower(txt), lt); n > 0 {
+				row.Threads++
+				row.Mentions += n
+			}
+		}
+		out = append(out, row)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Threads != out[j].Threads {
+			return out[i].Threads > out[j].Threads
+		}
+		return out[i].Mentions > out[j].Mentions
+	})
+	return out
+}
+
+func research(ctx context.Context, queries []string, sub, sortBy, tm string, threads int, terms []string, max int) error {
+	var found []result
+	seen := map[string]bool{}
+	for _, q := range queries {
+		var raw string
+		if err := loadPage(ctx, searchTarget(q, sub, sortBy, tm), extractJS, &raw); err != nil {
+			return err
+		}
+		for _, r := range parseResults(raw) {
+			if !seen[r.URL] {
+				seen[r.URL] = true
+				found = append(found, r)
+			}
+		}
+	}
+	if len(found) == 0 {
+		fmt.Println("no results")
+		return nil
+	}
+	if threads > 0 && len(found) > threads {
+		found = found[:threads]
+	}
+	texts := map[string]string{}
+	for _, r := range found {
+		var txt string
+		var err error
+		for try := 0; try < 3; try++ {
+			if err = loadPage(ctx, r.URL, `document.body.innerText`, &txt); err == nil {
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "skipped %s: %v\n", r.URL, err)
+			continue
+		}
+		texts[r.URL] = txt
+	}
+	if len(texts) == 0 {
+		return fmt.Errorf("none of the %d threads could be read", len(found))
+	}
+	if len(terms) > 0 {
+		fmt.Printf("Mentions across %d threads:\n", len(texts))
+		for _, t := range countTerms(texts, terms) {
+			fmt.Printf("  %-24s %2d threads  %3d mentions\n", t.Term, t.Threads, t.Mentions)
+		}
+		fmt.Println()
+	}
+	for _, r := range found {
+		if txt, ok := texts[r.URL]; ok {
+			fmt.Printf("=== r/%s  %s\n%s\n\n%s\n\n", r.Sub, r.Title, r.URL, clip(txt, max))
+		}
+	}
+	return nil
 }
