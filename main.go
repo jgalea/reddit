@@ -104,6 +104,42 @@ func guardFocus(browserName string) func() {
 	return func() { close(done) }
 }
 
+// hideBrowser hides our Chrome instance (found by its profile) like Cmd-H.
+func hideBrowser(profile string) {
+	out, err := exec.Command("pgrep", "-o", "-f", "user-data-dir="+profile).Output()
+	pid := strings.TrimSpace(string(out))
+	if err != nil || pid == "" {
+		return
+	}
+	exec.Command("osascript", "-e",
+		`tell application "System Events" to set visible of (first process whose unix id is `+pid+`) to false`).Run()
+}
+
+// parkWindow rewrites the profile's remembered window position off-screen,
+// since Chrome restores that instead of honouring --window-position.
+func parkWindow(profile string) {
+	path := filepath.Join(profile, "Default", "Preferences")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var prefs map[string]any
+	if json.Unmarshal(b, &prefs) != nil {
+		return
+	}
+	br, _ := prefs["browser"].(map[string]any)
+	if br == nil {
+		br = map[string]any{}
+		prefs["browser"] = br
+	}
+	br["window_placement"] = map[string]any{
+		"left": -3000, "top": -3000, "right": -1720, "bottom": -2100, "maximized": false,
+	}
+	if out, err := json.Marshal(prefs); err == nil {
+		os.WriteFile(path, out, 0o600)
+	}
+}
+
 func openBackground(timeout time.Duration) (context.Context, func(), error) {
 	profile := filepath.Join(home(), "profile")
 	if err := os.MkdirAll(profile, 0o700); err != nil {
@@ -115,11 +151,18 @@ func openBackground(timeout time.Duration) (context.Context, func(), error) {
 	if p := os.Getenv("REDDIT_CHROME_APP"); p != "" {
 		app = p
 	}
+	parkWindow(profile)
 	stopGuard := guardFocus(app)
 	err := exec.Command("open", "-g", "-j", "-n", "-a", app, "--args",
 		"--remote-debugging-port=0",
 		"--user-data-dir="+profile, "--no-first-run", "--no-default-browser-check",
-		"--window-size=1280,900").Run()
+		"--window-size=1280,900",
+		// park the window off-screen so it never shows over the user's work,
+		// and keep the hidden page rendering at full speed
+		"--window-position=-3000,-3000",
+		"--disable-backgrounding-occluded-windows",
+		"--disable-renderer-backgrounding",
+		"--disable-background-timer-throttling").Run()
 	if err != nil {
 		return nil, nil, fmt.Errorf("could not start %s in the background: %w", app, err)
 	}
@@ -157,6 +200,10 @@ func openBackground(timeout time.Duration) (context.Context, func(), error) {
 		ctx, c = context.WithTimeout(ctx, timeout)
 		cancels = append(cancels, c)
 	}
+	// macOS clamps windows back to the screen edge, so hide the whole app
+	// once the tab exists; the flags above keep hidden pages running.
+	chromedp.Run(ctx)
+	hideBrowser(profile)
 	return ctx, func() {
 		defer stopGuard()
 		// quit the whole browser so nothing keeps running
